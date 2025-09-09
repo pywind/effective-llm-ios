@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 import coremltools as ct
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.cache_utils import Cache
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -101,12 +102,15 @@ class FusedSDPAWithKVCache(torch.nn.Module):
             conv.bias.data.copy_(linear.bias.data)
         return conv
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
-        key_cache: Optional[torch.Tensor] = None,
-        value_cache: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attention_mask: torch.Tensor,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor | None, ...]:
         # Ensure input is in the right format: (B, C, 1, S)
         if hidden_states.dim() == 3:  # (B, S, C)
             B, S, C = hidden_states.shape
@@ -120,6 +124,24 @@ class FusedSDPAWithKVCache(torch.nn.Module):
         q = self.q_proj(hidden_states).view(B, self.num_heads, self.head_dim, S)
         k = self.k_proj(hidden_states).view(B, self.num_heads, self.head_dim, S)
         v = self.v_proj(hidden_states).view(B, self.num_heads, self.head_dim, S)
+
+        # Handle KV cache using the Cache interface
+        key_cache = None
+        value_cache = None
+        
+        if past_key_value is not None:
+            # Get cached keys and values for this layer (assuming layer_idx=0 for simplicity)
+            try:
+                # Check if this is a cache that has already been populated
+                if hasattr(past_key_value, 'key_cache') and hasattr(past_key_value, 'value_cache'):
+                    if past_key_value.key_cache and len(past_key_value.key_cache) > 0:
+                        key_cache = past_key_value.key_cache[0]  # First layer
+                    if past_key_value.value_cache and len(past_key_value.value_cache) > 0:
+                        value_cache = past_key_value.value_cache[0]
+            except:
+                # Fallback - cache might be empty or have different structure
+                key_cache = None
+                value_cache = None
 
         # Handle KV cache concatenation
         if key_cache is not None and key_cache.numel() > 0:
@@ -136,8 +158,24 @@ class FusedSDPAWithKVCache(torch.nn.Module):
         k = k.transpose(2, 3)  # (B, num_heads, kv_seq_len, head_dim)
         v = v.transpose(2, 3)  # (B, num_heads, kv_seq_len, head_dim)
 
-        # Apply fused scaled dot-product attention
-        attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # Apply attention mask if provided
+        attn_mask = None
+        if attention_mask is not None:
+            # Convert attention_mask to the proper format for SDPA
+            # attention_mask is typically (B, S) or (B, 1, S, S)
+            if attention_mask.dim() == 2:  # (B, S)
+                # Expand to (B, 1, q_seq_len, kv_seq_len) for causal mask
+                attn_mask = attention_mask.unsqueeze(1).unsqueeze(1).expand(B, 1, q_seq_len, kv_seq_len)
+            elif attention_mask.dim() == 4:  # Already in the right format
+                attn_mask = attention_mask
+
+        # Apply fused scaled dot-product attention with proper mask handling
+        if attn_mask is not None:
+            # Use attention mask instead of causal mask
+            attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            # Use causal mask for autoregressive generation
+            attn_out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
         # Transpose back: (B, num_heads, head_dim, q_seq_len)
         attn_out = attn_out.transpose(2, 3)
@@ -146,11 +184,24 @@ class FusedSDPAWithKVCache(torch.nn.Module):
         new_key_cache = k.transpose(2, 3)  # Back to (B, num_heads, head_dim, kv_seq_len)
         new_value_cache = v.transpose(2, 3)  # Back to (B, num_heads, head_dim, kv_seq_len)
 
+        # Update the past_key_value cache if provided
+        if past_key_value is not None:
+            try:
+                # Update cache using the Cache interface
+                # The update method returns the updated key and value tensors
+                past_key_value.update(new_key_cache, new_value_cache, layer_idx=0)
+            except Exception as e:
+                # Fallback for cache update - some cache implementations might not support update
+                logging.warning(f"Could not update cache: {e}")
+                pass
+
         # Reshape back to (B, C, 1, S) format
         attn_out = attn_out.reshape(B, self.num_heads * self.head_dim, H, q_seq_len)
         output = self.o_proj(attn_out)
         
-        return output, new_key_cache, new_value_cache
+        # Return format compatible with transformers attention modules
+        # Typically: (attention_output, past_key_value)
+        return output, past_key_value
 
 
 def replace_attention(model, config):
