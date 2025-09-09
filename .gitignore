@@ -60,3 +60,26 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# CoreML models and test artifacts
+*.mlpackage/
+*.mlmodelc/
+*.mlmodel
+test_models/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
